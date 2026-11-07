@@ -3,7 +3,7 @@
 //! safety net).
 
 use crate::Settings;
-use crate::engine::{Engine, Outcome, PairState, SELF, Snap, Stats};
+use crate::engine::{ENTRY, Engine, Outcome, PairState, SELF, Snap, Stats};
 use crate::util::{dur, size};
 use crate::watch::{Ev, Watcher};
 use crate::{log, vlog};
@@ -22,8 +22,11 @@ const COOL_FACTOR: u32 = 10;
 const MAX_DIRTY: usize = 1_000_000;
 const MAX_MOVES: usize = 100_000;
 
-/// One full pass per pair, then exit. Exit codes follow rsync: 23 for
-/// partial transfers, 20 when interrupted.
+/// rsync's exit code for "error in file I/O": a pass failed as a whole.
+const EXIT_FAILED: i32 = 11;
+
+/// One full pass per pair, then exit. Exit codes follow rsync: 11 when a
+/// pass failed as a whole, 23 when some files did, 20 when interrupted.
 pub fn run_once(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
     let status = Status::new(set.status_file.clone());
     let mut failed = false;
@@ -33,16 +36,43 @@ pub fn run_once(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
         }
         status.set(&[("state", "syncing"), ("pair", &ps.pair.name)], eng);
         let o = full_pass(eng, ps, set, "", &status);
-        failed |= o.as_ref().is_none_or(|o| o.aborted);
+        if let Some(code) = give_up(&o, set, &status, eng) {
+            return code;
+        }
+        failed |= failure(&o).is_some();
     }
     status.set(&[("state", "done"), ("pair", "")], eng);
     if eng.stop.load(Relaxed) {
         return 20;
     }
-    if failed || eng.stats.snap().errors > 0 { 23 } else { 0 }
+    if failed {
+        EXIT_FAILED
+    } else if eng.stats.snap().errors > 0 {
+        23
+    } else {
+        0
+    }
 }
 
-fn full_pass(eng: &Engine, ps: &PairState, set: &Settings, why: &str, status: &Status) -> Option<Outcome> {
+/// Why a pass failed as a whole, if it did: it couldn't start (say, the
+/// destination is unmounted) or the destination failed during it.
+fn failure(o: &Result<Outcome, String>) -> Option<String> {
+    match o {
+        Err(e) => Some(e.clone()),
+        Ok(o) => o.aborted.clone(),
+    }
+}
+
+/// With --exit-on-error, a pass that failed as a whole ends fansync: the
+/// exit code to use then.
+fn give_up(o: &Result<Outcome, String>, set: &Settings, status: &Status, eng: &Engine) -> Option<i32> {
+    let why = failure(o).filter(|_| set.exit_on_error)?;
+    log!("error: stopping, as --exit-on-error asks: {why}");
+    status.set(&[("state", "failed"), ("error", &why)], eng);
+    Some(EXIT_FAILED)
+}
+
+fn full_pass(eng: &Engine, ps: &PairState, set: &Settings, why: &str, status: &Status) -> Result<Outcome, String> {
     let p = &ps.pair;
     if !set.quiet {
         log!("{}: full pass{why}: {} -> {}", p.name, p.src.display(), p.dst.display());
@@ -78,12 +108,12 @@ fn full_pass(eng: &Engine, ps: &PairState, set: &Settings, why: &str, status: &S
                     d.summary()
                 );
             }
-            Some(o)
+            Ok(o)
         }
         Err(e) => {
             eng.stats.errors.fetch_add(1, Relaxed);
             log!("error: {}: {e}", p.name);
-            None
+            Err(format!("{}: {e}", p.name))
         }
     }
 }
@@ -213,6 +243,9 @@ pub fn run(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
         }
         status.set(&[("state", "initial-sync"), ("pair", &ps.pair.name)], eng);
         let o = full_pass(eng, ps, set, "", &status);
+        if let Some(code) = give_up(&o, set, &status, eng) {
+            return code;
+        }
         after_pass(&mut pend[i], o, set, &cool[i]);
     }
     status.set(&[("state", "watching"), ("pair", ""), ("last_full_pass", &epoch())], eng);
@@ -252,10 +285,14 @@ pub fn run(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
                         break;
                     }
                     log!("warning: the event watcher stopped; falling back to a full pass every {}", dur(set.interval));
+                    // Events may have been lost on the way (as with an
+                    // overflow), so start with a full pass.
+                    let now = Instant::now();
                     for i in 0..n {
                         if watched[i] {
                             watched[i] = false;
-                            next_poll[i] = Some(Instant::now() + set.interval);
+                            pend[i].full(now, " (event watcher stopped)");
+                            next_poll[i] = Some(now + set.interval);
                         }
                     }
                 }
@@ -296,8 +333,10 @@ pub fn run(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
             if eng.stop.load(Relaxed) {
                 break;
             }
-            if pend[i].due_at(set).is_some_and(|t| t <= Instant::now()) {
-                process(eng, &states[i], &mut pend[i], &mut cool[i], set, &status);
+            if pend[i].due_at(set).is_some_and(|t| t <= Instant::now())
+                && let Some(code) = process(eng, &states[i], &mut pend[i], &mut cool[i], set, &status)
+            {
+                return code;
             }
         }
     }
@@ -324,10 +363,20 @@ fn absorb(
                 // /tmp...). Whether it's a directory isn't known yet, so only
                 // when excluded either way.
                 let filter = &states[i].pair.filter;
-                if filter.parent_excluded(&rel) || (filter.excluded(&rel, false) && filter.excluded(&rel, true)) {
+                if filter.parent_excluded(&rel) {
                     continue;
                 }
-                queue(p, &cool[i], rel, f, now);
+                if filter.excluded(&rel, false) && filter.excluded(&rel, true) {
+                    // Creating, deleting or renaming an excluded entry still
+                    // changes its directory's mtime, which is mirrored.
+                    if f & ENTRY == 0 {
+                        continue;
+                    }
+                    let parent = rel[..rel.iter().rposition(|&c| c == b'/').unwrap_or(0)].to_vec();
+                    queue(p, &cool[i], parent, SELF, now);
+                } else {
+                    queue(p, &cool[i], rel, f, now);
+                }
                 if p.dirty.len() > MAX_DIRTY {
                     log!(
                         "{}: more than {MAX_DIRTY} changed paths queued; doing a full pass instead",
@@ -368,6 +417,8 @@ fn absorb(
     }
 }
 
+/// Runs what's pending for a pair. Returns an exit code if fansync should
+/// stop (--exit-on-error).
 fn process(
     eng: &Engine,
     ps: &PairState,
@@ -375,7 +426,7 @@ fn process(
     cool: &mut HashMap<Vec<u8>, Instant>,
     set: &Settings,
     status: &Status,
-) {
+) -> Option<i32> {
     let dirty = std::mem::take(&mut p.dirty);
     let moves = std::mem::take(&mut p.moves);
     let links = std::mem::take(&mut p.links);
@@ -388,7 +439,7 @@ fn process(
     status.set(&[("state", "syncing"), ("pair", &ps.pair.name)], eng);
     let o = if rescan {
         let o = full_pass(eng, ps, set, why, status);
-        if o.is_some() {
+        if o.is_ok() {
             status.set(&[("last_full_pass", &epoch())], eng);
         }
         o
@@ -412,17 +463,20 @@ fn process(
                 } else {
                     vlog!("{}: {count} paths checked, nothing to do", ps.pair.name);
                 }
-                Some(o)
+                Ok(o)
             }
             Err(e) => {
                 eng.stats.errors.fetch_add(1, Relaxed);
                 log!("error: {}: {e}", ps.pair.name);
-                None
+                Err(format!("{}: {e}", ps.pair.name))
             }
         }
     };
+    if let Some(code) = give_up(&o, set, status, eng) {
+        return Some(code);
+    }
     let now = Instant::now();
-    if let Some(o) = &o {
+    if let Ok(o) = &o {
         for (rel, took) in &o.slow {
             cool.insert(rel.clone(), now + *took * COOL_FACTOR);
         }
@@ -430,6 +484,7 @@ fn process(
     cool.retain(|_, t| *t > now);
     after_pass(p, o, set, cool);
     status.set(&[("state", "watching"), ("pair", ""), ("pending", &p.dirty.len().to_string())], eng);
+    None
 }
 
 /// Queues a changed path, or holds it back while it is cooling down.
@@ -445,10 +500,10 @@ fn queue(p: &mut Pending, cool: &HashMap<Vec<u8>, Instant>, rel: Vec<u8>, f: u8,
 }
 
 /// Requeues what a pass couldn't finish.
-fn after_pass(p: &mut Pending, o: Option<Outcome>, set: &Settings, cool: &HashMap<Vec<u8>, Instant>) {
+fn after_pass(p: &mut Pending, o: Result<Outcome, String>, set: &Settings, cool: &HashMap<Vec<u8>, Instant>) {
     let now = Instant::now();
     match o {
-        Some(o) if !o.aborted => {
+        Ok(o) if o.aborted.is_none() => {
             // Files that changed while being copied go through the cooldown
             // too, or a constantly written big file would be copied nonstop.
             for rel in o.redo {

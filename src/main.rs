@@ -104,6 +104,10 @@ struct Cli {
     /// Keep FILE updated with the current state as shell KEY=value lines.
     #[arg(long, value_name = "FILE")]
     status_file: Option<PathBuf>,
+    /// Exit (code 11) when a pass fails as a whole, for instance because the
+    /// destination drive fails, instead of retrying every --interval.
+    #[arg(long)]
+    exit_on_error: bool,
     /// Copy hard-linked files separately instead of linking them.
     #[arg(long)]
     no_hard_links: bool,
@@ -149,6 +153,7 @@ struct Config {
     drop_cache: Option<bool>,
     low_priority: Option<bool>,
     status_file: Option<PathBuf>,
+    exit_on_error: Option<bool>,
     hard_links: Option<bool>,
     xattrs: Option<bool>,
     sparse: Option<bool>,
@@ -194,6 +199,7 @@ pub struct Settings {
     pub link_delay: Duration,
     pub no_watch: bool,
     pub status_file: Option<PathBuf>,
+    pub exit_on_error: bool,
 }
 
 fn main() {
@@ -320,6 +326,7 @@ fn run() -> Result<i32> {
         link_delay: secs(cli.link_delay.or(cfg.link_delay).unwrap_or(300.0), "--link-delay")?,
         no_watch: cli.no_watch,
         status_file: cli.status_file.clone().or(cfg.status_file.clone()),
+        exit_on_error: cli.exit_on_error || cfg.exit_on_error.unwrap_or(false),
     };
 
     unsafe { libc::umask(0) };

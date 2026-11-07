@@ -6,6 +6,7 @@ exits 1 if there are any.
 
 usage: treecmp.py SRC DST [--exclude-root NAME ...]
 """
+import fnmatch
 import hashlib, os, stat, sys
 
 def xattrs(p):
@@ -29,12 +30,16 @@ def digest(p):
     return h.hexdigest()
 
 def walk(root, skip):
+    # Plain names are skipped at the top level, patterns (with *) anywhere.
+    pats = [s for s in skip if '*' in s]
     out = {}
     for dirpath, dirs, files in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root)
         if rel_dir == '.':
             dirs[:] = [d for d in dirs if d not in skip]
             files = [f for f in files if f not in skip]
+        dirs[:] = [d for d in dirs if not any(fnmatch.fnmatchcase(d, p) for p in pats)]
+        files = [f for f in files if not any(fnmatch.fnmatchcase(f, p) for p in pats)]
         for n in dirs + files:
             p = os.path.join(dirpath, n)
             out[os.path.normpath(os.path.join(rel_dir, n))] = p

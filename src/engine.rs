@@ -33,6 +33,9 @@ pub const SELF: u8 = 1;
 pub const REC: u8 = 2;
 /// Internal: already the result of a missing destination parent.
 const ESCALATED: u8 = 4;
+/// From the watcher: the entry was created, deleted or renamed, which
+/// changed its directory too.
+pub const ENTRY: u8 = 8;
 
 /// Copy chunk per syscall; also how often a copy checks for Ctrl-C.
 const CHUNK: u64 = 64 << 20;
@@ -97,7 +100,7 @@ impl Snap {
             (self.linked, "hard-linked"),
             (self.moved, "moved"),
             (self.vanished, "vanished"),
-            (self.errors, "errors"),
+            (self.errors, if self.errors == 1 { "error" } else { "errors" }),
         ] {
             if n > 0 {
                 s.push(format!("{n} {what}"));
@@ -296,8 +299,9 @@ pub struct Outcome {
     pub slow: Vec<(Vec<u8>, Duration)>,
     /// Files that changed while being copied.
     pub redo: Vec<Vec<u8>>,
-    /// The pass stopped early on a destination error such as a full disk.
-    pub aborted: bool,
+    /// Why the pass stopped early: the destination failed (I/O errors, a
+    /// full or read-only filesystem).
+    pub aborted: Option<String>,
     /// A file gained a hard link whose other names aren't known; a full
     /// pass is needed to link them in the destination.
     pub links_unknown: bool,
@@ -494,11 +498,32 @@ enum Target<'a> {
     At(RawFd, &'a CStr),
 }
 
+/// Copies up to `want` bytes at `pos` through user space.
+fn copy_rw(sfd: RawFd, dfd: RawFd, pos: u64, want: usize) -> Result<usize, Fail> {
+    RW_BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        if buf.is_empty() {
+            buf.resize(1 << 20, 0);
+        }
+        let n = want.min(buf.len());
+        let n = sys::pread_full(sfd, &mut buf[..n], pos).map_err(sf("read"))?;
+        sys::pwrite_all(dfd, &buf[..n], pos).map_err(df("write"))?;
+        Ok(n)
+    })
+}
+
 /// A failed step of a file transfer.
 struct Fail {
     what: &'static str,
     err: io::Error,
     src: bool,
+}
+
+/// Destination errors that mean the whole destination is failing, not one
+/// file: I/O errors (a dying or disconnected drive), filesystem corruption,
+/// a lost FUSE or network connection, or no space or writes left.
+fn dst_failed(err: &io::Error) -> bool {
+    matches!(sys::errno(err), libc::EIO | libc::EUCLEAN | libc::ENOTCONN | libc::ENOSPC | libc::EDQUOT | libc::EROFS)
 }
 
 fn sf(what: &'static str) -> impl FnOnce(io::Error) -> Fail {
@@ -530,6 +555,7 @@ struct Run<'a> {
     full: bool,
     root_created: bool,
     abort: AtomicBool,
+    abort_why: Mutex<Option<String>>,
     links_unknown: AtomicBool,
     /// Multiply-linked files met in this pass, synced together at the end.
     hl: Mutex<Links>,
@@ -608,6 +634,7 @@ impl<'a> Run<'a> {
             full,
             root_created,
             abort: AtomicBool::new(false),
+            abort_why: Mutex::new(None),
             links_unknown: AtomicBool::new(false),
             hl: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashSet::new()),
@@ -621,7 +648,7 @@ impl<'a> Run<'a> {
         Outcome {
             slow: self.slow.into_inner().unwrap(),
             redo: self.redo.into_inner().unwrap(),
-            aborted: self.abort.into_inner(),
+            aborted: self.abort_why.into_inner().unwrap(),
             links_unknown: self.links_unknown.into_inner(),
         }
     }
@@ -634,28 +661,39 @@ impl<'a> Run<'a> {
         self.abort.load(Relaxed) || self.e.stop.load(Relaxed)
     }
 
+    /// Errors in the destination. Some mean the destination as a whole is
+    /// failing (a dying or disconnected drive, a full or read-only
+    /// filesystem); then the pass stops instead of failing file by file.
     fn error(&self, rel: &[u8], what: &str, err: &io::Error) {
-        if self.stopped() && sys::errno(err) == libc::EINTR {
+        // After a stop, errors are mostly its consequences.
+        if self.abort.load(Relaxed) || (self.stopped() && sys::errno(err) == libc::EINTR) {
+            return;
+        }
+        let msg = format!("{}: {what} {}: {err}", self.ps.pair.name, show(rel));
+        // Other threads may run into the same failure meanwhile: count and
+        // report it once.
+        if dst_failed(err) && self.abort.swap(true, Relaxed) {
             return;
         }
         self.e.stats.errors.fetch_add(1, Relaxed);
-        if matches!(sys::errno(err), libc::ENOSPC | libc::EDQUOT | libc::EROFS) {
-            if !self.abort.swap(true, Relaxed) {
-                log!("error: {}: {what} {}: {err}; stopping this pass", self.ps.pair.name, show(rel));
-            }
+        if dst_failed(err) {
+            log!("error: {msg}; stopping this pass");
+            *self.abort_why.lock().unwrap() = Some(msg);
             return;
         }
-        log!("error: {}: {what} {}: {err}", self.ps.pair.name, show(rel));
+        log!("error: {msg}");
     }
 
     /// Errors reading the source. Files disappearing is normal on a live
-    /// system, so those are only counted.
+    /// system, so those are only counted; others (an unreadable file) fail
+    /// that file only.
     fn src_error(&self, rel: &[u8], what: &str, err: &io::Error) {
         if matches!(sys::errno(err), libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::ESTALE) {
             self.e.stats.vanished.fetch_add(1, Relaxed);
             dlog!("{}: {} vanished", self.ps.pair.name, show(rel));
-        } else {
-            self.error(rel, what, err);
+        } else if !(self.stopped() && sys::errno(err) == libc::EINTR) {
+            self.e.stats.errors.fetch_add(1, Relaxed);
+            log!("error: {}: {what} {}: {err}", self.ps.pair.name, show(rel));
         }
     }
 
@@ -716,7 +754,7 @@ impl<'a> Run<'a> {
                         self.emit(&item, b"", "");
                     }
                 }
-                Err(e) => self.error(b"", "stat", &e),
+                Err(e) => self.error(b"", "stat destination", &e),
             }
         }
     }
@@ -1165,6 +1203,9 @@ impl<'a> Run<'a> {
                         self.ps.copy_mode.store(MODE_SENDFILE, Relaxed);
                         continue;
                     }
+                    // Either file's drive could have failed: copying this
+                    // chunk through user space tells which.
+                    Err(e) if sys::errno(&e) == libc::EIO => copy_rw(sfd, dfd, pos, want)?,
                     Err(e) => return Err(Fail { what: "copy", err: e, src: false }),
                 },
                 // Across filesystems: still a single in-kernel copy, no trip
@@ -1178,19 +1219,11 @@ impl<'a> Run<'a> {
                             self.ps.copy_mode.store(MODE_RW, Relaxed);
                             continue;
                         }
+                        Err(e) if sys::errno(&e) == libc::EIO => copy_rw(sfd, dfd, pos, want)?,
                         Err(e) => return Err(Fail { what: "copy", err: e, src: false }),
                     }
                 }
-                _ => RW_BUF.with(|b| {
-                    let mut buf = b.borrow_mut();
-                    if buf.is_empty() {
-                        buf.resize(1 << 20, 0);
-                    }
-                    let n = want.min(buf.len());
-                    let n = sys::pread_full(sfd, &mut buf[..n], pos).map_err(sf("read"))?;
-                    sys::pwrite_all(dfd, &buf[..n], pos).map_err(df("write"))?;
-                    Ok::<usize, Fail>(n)
-                })?,
+                _ => copy_rw(sfd, dfd, pos, want)?,
             };
             if n == 0 {
                 break;

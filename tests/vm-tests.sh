@@ -2,8 +2,8 @@
 # Runs the test suites as real root, the way fansync runs on a host: real
 # open_by_handle_at, an unlimited event queue, foreign owners, device nodes,
 # trusted.* xattrs and file capabilities. Meant for a throwaway VM (it mounts
-# filesystems and runs as root); see tests/vm.sh. ONLY="basic btrfs rsync
-# fuzz" picks sections; FUZZ_ROUNDS sets the number of random rounds.
+# filesystems and runs as root); see tests/vm.sh. ONLY="basic btrfs drives
+# rsync fuzz" picks sections; FUZZ_ROUNDS sets the number of random rounds.
 set -u
 cd "$(dirname "$0")/.."
 F=$PWD/target/release/fansync
@@ -57,6 +57,11 @@ fi
 if want btrfs; then
 section "btrfs subvolumes"
 tests/btrfs-test.sh > /tmp/b.out 2>&1; grep -v "^ok" /tmp/b.out; result $(grep -c "^FAIL" /tmp/b.out) "btrfs-test: $(grep -c '^ok' /tmp/b.out) ok"
+fi
+
+if want drives; then
+section "failing drives (device-mapper)"
+tests/drive-failure-test.sh > /tmp/d.out 2>&1; grep -v "^ok" /tmp/d.out; result $(grep -c "^FAIL" /tmp/d.out) "drive-failure-test: $(grep -c '^ok' /tmp/d.out) ok"
 fi
 
 if want rsync; then

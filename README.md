@@ -58,6 +58,7 @@ interval = 10           # minutes between passes for sources that can't be watch
 link_delay = 300        # backstop: full pass for hard links whose other names weren't found
 inplace_min = "32M"     # update existing files at least this big in place
 status_file = "/run/backup.status"
+exit_on_error = true    # stop when the destination fails, instead of retrying
 exclude = ["*.swp"]     # applied to every pair, before the pair's own rules
 
 [[pair]]
@@ -163,9 +164,9 @@ On a 9.6 GB, 205k-entry tree (warm cache, NVMe):
   Until then the new name is a separate copy with the same content.
 - **Unmounted source or destination:** if either filesystem changes while
   running (for example an unmount), passes fail instead of mirroring an empty
-  mount point or writing elsewhere. They're retried every `interval` minutes.
-  With `--delete`, a pass is also refused when the source is empty but the
-  destination isn't.
+  mount point or writing elsewhere. They're retried every `interval` minutes
+  (or fansync exits, with `--exit-on-error`). With `--delete`, a pass is also
+  refused when the source is empty but the destination isn't.
 - **Mounts inside the destination:** nothing mounted inside the destination
   is ever deleted into. That includes bind mounts of the same filesystem,
   through which rsync `-x --delete` deletes files that live elsewhere.
@@ -178,9 +179,20 @@ On a 9.6 GB, 205k-entry tree (warm cache, NVMe):
   `AT_SYMLINK_NOFOLLOW`).
 - **Renames:** these are only mirrored with `--delete`. Without it, the old
   name stays, as with rsync.
-- **Errors:** a full disk or read-only destination stops the pass, and it's
-  retried after `interval` minutes. Files vanishing during a pass are normal
-  on a live system and are only counted.
+- **A failing destination drive:** I/O errors in the destination, or a
+  destination that is full or has gone read-only (as btrfs and ext4 do after a
+  device failure), stop the pass at the first error instead of failing file
+  by file. It's retried after `interval` minutes. A drive that needs a power
+  cycle won't recover by itself, though, so `--exit-on-error` (or
+  `exit_on_error = true`) makes fansync exit instead, with code 11, the reason
+  in the log, and `state='failed'` plus `error` in the status file. Errors
+  only show up when fansync next writes, so a drive that fails while nothing
+  changes is noticed with the next change.
+- **Errors in the source:** files vanishing during a pass are normal on a
+  live system and are only counted. A file that can't be read (a bad sector)
+  fails on its own; the rest of the pass goes on. When an in-kernel copy
+  fails, fansync redoes that chunk through user space to tell which drive
+  failed.
 
 ## Requirements
 
@@ -210,25 +222,29 @@ On a 9.6 GB, 205k-entry tree (warm cache, NVMe):
 ## Monitoring
 
 `--status-file FILE` keeps a file of shell `KEY='value'` lines up to date:
-`state` (`initial-sync`, `watching`, `syncing`, `done`, `stopped`), `pair`,
-`pid`, `started`, `updated`, `last_full_pass`, `last_change`, `pending`,
-`copied_files`, `written_bytes`, `deleted` and `errors`.
+`state` (`initial-sync`, `watching`, `syncing`, `done`, `stopped`, `failed`),
+`pair`, `pid`, `started`, `updated`, `last_full_pass`, `last_change`,
+`pending`, `copied_files`, `written_bytes`, `deleted`, `errors`, and `error`
+(why fansync stopped, with `--exit-on-error`).
 
 `-i` prints rsync-style itemized changes (`>f.st...... path`), plus
 `*moving     old => new` for mirrored renames. `-v` prints changed paths and
 `-vv` adds debug output.
 
-Exit codes in `--once` mode follow rsync: 0 means success, 23 means some
-files failed, 20 means interrupted, and 1 is a fatal error.
+Exit codes follow rsync: 0 means success, 23 means some files failed, 11
+means a pass failed as a whole (the destination failed, or a pass couldn't
+start), 20 means interrupted, and 1 is a fatal error. In watch mode, fansync
+only exits on its own with `--exit-on-error` (code 11).
 
 ## Tests
 
 ```sh
 cargo test                        # filter matching, path ordering, parsing
 tests/vs-rsync.sh                 # same results as rsync for 16 filter/delete cases
-unshare -Urm tests/watch-test.sh  # watch mode, 21 scenarios on a tmpfs source
+unshare -Urm tests/watch-test.sh  # watch mode, 26 scenarios on a tmpfs source
 unshare -Urm tests/fuzz-watch.sh  # random concurrent changes while watching, then an exact comparison
 unshare -Urm tests/safety-test.sh # unmounted/empty source, mounts in the destination, ...
 tests/mktree.py DIR && fansync --once SRC/ DST/ && tests/treecmp.py SRC DST
-tests/vm.sh tests/vm-tests.sh     # all of it as real root in a QEMU VM, plus ext4 and btrfs subvolumes
+tests/vm.sh tests/vm-tests.sh     # all of it as real root in a QEMU VM, plus ext4, btrfs subvolumes
+                                  # and failing drives (device-mapper)
 ```

@@ -16,7 +16,7 @@ if [[ ${SRCFS:-tmpfs} == ext4 ]]; then
 python3 "$D/mktree.py" "$T/src"
 mkdir -p "$T/src/excluded" && echo x > "$T/src/excluded/f"
 LOG=$T/log
-"$F" --delete -i --settle 0.3 --max-delay 3 --link-delay 600 --exclude=/excluded/ "${@}" "$T/src/" "$T/dst/" >"$LOG" 2>&1 &
+"$F" --delete -i --settle 0.3 --max-delay 3 --link-delay 600 --exclude=/excluded/ --exclude='*.skip' "${@}" "$T/src/" "$T/dst/" >"$LOG" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null' EXIT
 for _ in $(seq 100); do grep -q "watching for changes" "$LOG" && break; sleep 0.1; done
@@ -24,7 +24,7 @@ grep "watching for changes" "$LOG" || { cat "$LOG"; exit 1; }
 fail=0
 check() {
   sleep "${WAIT:-1.5}"
-  if out=$(python3 "$D/treecmp.py" "$T/src" "$T/dst" --skip excluded); then
+  if out=$(python3 "$D/treecmp.py" "$T/src" "$T/dst" --skip excluded --skip '*.skip'); then
     echo "ok   $1"
   else
     echo "FAIL $1"; echo "$out" | sed 's/^/     /'; fail=1
@@ -69,6 +69,16 @@ check "new sparse file"
 echo changed > excluded/f; echo new > excluded/g
 check "changes in an excluded dir are ignored"
 [[ ! -e "$T/dst/excluded/g" ]] && echo "ok   excluded file not copied" || { echo "FAIL excluded file copied"; fail=1; }
+mkdir -p skipdir && echo y > skipdir/kept
+check "a directory for excluded files"
+same_root() { [[ $(stat -c %y "$T/src") == $(stat -c %y "$T/dst") ]] || { echo "     root mtime differs"; return 1; }; }
+echo x > skipdir/x.skip; echo x > x.skip
+check "excluded files created: their directories' mtimes still synced"; same_root || fail=1
+mv skipdir/x.skip skipdir/y.skip
+check "excluded file renamed"
+rm skipdir/y.skip x.skip
+check "excluded files deleted"; same_root || fail=1
+[[ ! -e $T/dst/skipdir/x.skip && ! -e $T/dst/x.skip ]] && echo "ok   excluded files not copied" || { echo "FAIL excluded files copied"; fail=1; }
 ( for i in $(seq 200); do echo "line $i" >> busy.log; sleep 0.01; done )
 WAIT=4 check "file written continuously"
 mkdir -p q && for i in $(seq 2000); do echo $i > q/$i; done; rm q/1*; mv q q2

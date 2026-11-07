@@ -6,7 +6,7 @@
 //! plus the entry's name, and handles are turned back into paths with
 //! open_by_handle_at.
 
-use crate::engine::{REC, SELF};
+use crate::engine::{ENTRY, REC, SELF};
 use crate::sys::{DT_DIR, DT_UNKNOWN};
 use crate::{dlog, log, sys, vlog};
 use std::collections::HashMap;
@@ -358,10 +358,10 @@ impl Watcher {
                 }
             }
             for (p, r) in olds {
-                out.push(Ev::Dirty(p, r, SELF));
+                out.push(Ev::Dirty(p, r, SELF | ENTRY));
             }
             for (p, r) in news {
-                out.push(Ev::Dirty(p, r, if ondir { REC } else { SELF }));
+                out.push(Ev::Dirty(p, r, ENTRY | if ondir { REC } else { SELF }));
             }
             if ondir && let Some((fsid, h, Some(n))) = new {
                 self.index_dir(fsid, h, n, target, true);
@@ -373,6 +373,7 @@ impl Watcher {
             // A directory that appears may already have contents (moved in,
             // or filled before we looked), so it is synced recursively.
             let appeared = ondir && mask & (libc::FAN_CREATE | libc::FAN_MOVED_TO) != 0;
+            let entry = mask & (libc::FAN_CREATE | libc::FAN_DELETE | libc::FAN_MOVED_FROM | libc::FAN_MOVED_TO) != 0;
             for (p, rel) in self.locate(r, cache) {
                 if crate::util::verbose() >= 3 {
                     crate::util::log_line(format_args!("event {mask:#x} {}", crate::util::show(&rel)));
@@ -383,7 +384,8 @@ impl Watcher {
                 if !ondir && self.index.is_some() && r.2.is_some_and(|n| n != b".") {
                     self.note_links(p, &rel, cache, out);
                 }
-                out.push(Ev::Dirty(p, rel, if appeared { REC } else { SELF }));
+                let f = if appeared { REC } else { SELF };
+                out.push(Ev::Dirty(p, rel, if entry { f | ENTRY } else { f }));
             }
             if appeared && let (fsid, h, Some(n)) = r {
                 self.index_dir(fsid, h, n, target, mask & libc::FAN_MOVED_TO != 0);

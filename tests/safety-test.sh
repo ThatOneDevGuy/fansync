@@ -68,4 +68,33 @@ mount --bind "$T/dst/elsewhere" "$T/dst/backup/gone"; echo x > "$T/src/x"
 umount "$T/dst/backup/gone"
 [[ -e $T/dst/elsewhere/important ]] && ok "bind mount in the destination kept by --delete" || bad "deleted through a bind mount in the destination"
 umount "$T/dst"
+
+# 9-11. A failing destination drive (it goes read-only, or disappears):
+#    --exit-on-error ends fansync with code 11 and says why, in the log and
+#    the status file; without it, fansync keeps running and retries.
+watch_dst() { # ARGS...: watches src/ -> dst/, waits until it's watching
+  "$F" --settle 0.2 --status-file "$T/status" "$@" "$T/src/" "$T/dst/" > "$T/log" 2>&1 & pid=$!
+  for _ in $(seq 50); do grep -q "watching" "$T/log" && break; sleep 0.1; done
+}
+ended() { # sets rc to fansync's exit code, or "running" after 5 s
+  for _ in $(seq 50); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done
+  if kill -0 $pid 2>/dev/null; then rc=running; kill $pid; wait $pid 2>/dev/null; else wait $pid; rc=$?; fi
+}
+fresh; mount -t tmpfs s "$T/src"; mount -t tmpfs d "$T/dst"; echo a > "$T/src/a"
+watch_dst --exit-on-error
+mount -o remount,bind,ro "$T/dst"; echo b > "$T/src/b"; ended
+[[ $rc == 11 ]] && grep -q "stopping, as --exit-on-error asks: .*Read-only" "$T/log" &&
+  grep -q "^state='failed'" "$T/status" && grep -q "^error='.*Read-only" "$T/status" &&
+  ok "--exit-on-error: read-only destination ends fansync (exit $rc)" || { bad "--exit-on-error, read-only destination (rc $rc)"; tail -3 "$T/log"; }
+fresh; mount -t tmpfs s "$T/src"; mount -t tmpfs d "$T/dst"; echo a > "$T/src/a"
+watch_dst --exit-on-error
+umount -l "$T/dst"; echo b > "$T/src/b"; ended
+[[ $rc == 11 ]] && grep -q "stopping, as --exit-on-error asks: .*different filesystem" "$T/log" &&
+  ok "--exit-on-error: unmounted destination ends fansync (exit $rc)" || { bad "--exit-on-error, unmounted destination (rc $rc)"; tail -3 "$T/log"; }
+fresh; mount -t tmpfs s "$T/src"; mount -t tmpfs d "$T/dst"; echo a > "$T/src/a"
+watch_dst
+mount -o remount,bind,ro "$T/dst"; echo b > "$T/src/b"; ended
+[[ $rc == running ]] && grep -q "will retry" "$T/log" && [[ $(grep -c "^.*error:" "$T/log") == 1 ]] &&
+  ok "without --exit-on-error: one error, keeps running and retries" || { bad "without --exit-on-error (rc $rc)"; tail -3 "$T/log"; }
+umount "$T/dst"
 exit $fail
