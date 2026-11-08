@@ -14,6 +14,8 @@ mk() {  # mk ROOT: source-like tree
   echo k > "$1"/keep/deep/file; echo s > "$1"/swap; echo t > "$1"/cache.tmp; echo t > "$1"/etc/x.tmp
 }
 mk "$T/src"
+# Only in the source, so excluding them shows.
+echo d > "$T/src/2024-notes"; echo b > "$T/src/back\slash"; mkdir -p "$T/src/node_modules/m" "$T/src/opt/node_modules"
 # A destination with stale and extra content, some of it excluded.
 mk "$T/dst0"
 echo stale > "$T/dst0/etc/conf"; echo extra > "$T/dst0/etc/extra"; mkdir -p "$T/dst0/gone/sub"; echo g > "$T/dst0/gone/sub/f"
@@ -32,7 +34,7 @@ check() {  # check RSYNC-FILTER-ARGS...
     echo "ok   $case_n: $*"
   else
     echo "FAIL $case_n: $*"; fail=1
-    diff <(cd "$T/r" && find . -printf '%y %m %s %p\n' | sort) <(cd "$T/f" && find . -printf '%y %m %s %p\n' | sort) | sed 's/^/     /'
+    diff <(cd "$T/r" && find . -printf '%y %m %s %p\n' | sort) <(cd "$T/f" && find . -printf '%y %m %s %p\n' | sort) | sed 's/^/     /' || true
   fi
 }
 check
@@ -48,6 +50,9 @@ check --exclude='**/journal'
 check --exclude='/gone'
 check --exclude='sub/f'
 check --exclude='/home/sen/.profile' --exclude='[a-f]*'
+check --exclude='[[:digit:]]*'
+check --exclude='back\slash'
+check --exclude='**/node_modules'
 # Source without a trailing slash: rsync's patterns then start with its name.
 mkdir -p "$T/dst0/src/etc" && echo extra > "$T/dst0/src/etc/only-in-dst"
 SLASH= check --exclude='/src/etc/*'

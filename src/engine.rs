@@ -588,7 +588,9 @@ impl<'a> Run<'a> {
             Ok(fd) => Some(fd),
             Err(err) if sys::errno(&err) == libc::ENOENT => {
                 root_created = true;
-                if e.opts.dry_run {
+                // A source that excludes itself has nothing to copy, and
+                // rsync then doesn't create the destination either.
+                if e.opts.dry_run || ps.pair.filter.excluded_path(b"", true) {
                     None
                 } else {
                     // Only the last component is created, like rsync, so an

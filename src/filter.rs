@@ -7,6 +7,8 @@
 //! the last path component at any depth; an unanchored pattern with slashes
 //! is matched against the trailing components of the path. Rules are checked
 //! in order, the first match decides, and an unmatched path is included.
+//! As in rsync, a pattern without wildcards (*, ?, [) is compared literally,
+//! so a backslash is only an escape in a pattern with wildcards.
 
 #[derive(Clone, Debug)]
 struct Rule {
@@ -14,8 +16,16 @@ struct Rule {
     pat: Vec<u8>,
     anchored: bool,
     dir_only: bool,
+    /// Has wildcards; otherwise it's compared literally.
+    wild: bool,
     /// Contains "**", so it may match starting at any depth.
     wild2: bool,
+    /// Starts with "**": rsync matches it against "/" plus the path, so
+    /// "**/x" matches a top-level "x" too.
+    wild2_prefix: bool,
+    /// A malformed bracket expression or a trailing backslash, which rsync
+    /// never matches.
+    never: bool,
     /// How many path components the pattern spans.
     components: usize,
 }
@@ -31,15 +41,16 @@ pub struct Filter {
 impl Filter {
     pub fn add(&mut self, include: bool, pattern: &str) -> Result<(), String> {
         let mut p = pattern.as_bytes();
+        let wild = p.iter().any(|c| matches!(c, b'*' | b'?' | b'['));
         let anchored = p.first() == Some(&b'/');
         if anchored {
             p = &p[1..];
         }
         if let Some(base) = p.strip_suffix(b"/***") {
-            self.push(include, base, anchored, true);
+            self.push(include, base, anchored, true, wild);
             let mut all = base.to_vec();
             all.extend_from_slice(b"/**");
-            self.push(include, &all, anchored, false);
+            self.push(include, &all, anchored, false, wild);
             return Ok(());
         }
         let dir_only = p.ends_with(b"/");
@@ -49,17 +60,21 @@ impl Filter {
         if p.is_empty() {
             return Err(format!("invalid pattern {pattern:?}"));
         }
-        self.push(include, p, anchored, dir_only);
+        self.push(include, p, anchored, dir_only, wild);
         Ok(())
     }
 
-    fn push(&mut self, include: bool, pat: &[u8], anchored: bool, dir_only: bool) {
+    fn push(&mut self, include: bool, pat: &[u8], anchored: bool, dir_only: bool, wild: bool) {
+        let wild2 = wild && pat.windows(2).any(|w| w == b"**");
         self.rules.push(Rule {
             include,
             pat: pat.to_vec(),
             anchored,
             dir_only,
-            wild2: pat.windows(2).any(|w| w == b"**"),
+            wild,
+            wild2,
+            wild2_prefix: wild2 && !anchored && pat.starts_with(b"**"),
+            never: wild && !well_formed(pat),
             components: pat.iter().filter(|&&c| c == b'/').count() + 1,
         });
     }
@@ -148,11 +163,15 @@ impl Filter {
 
 impl Rule {
     fn matches(&self, rel: &[u8], is_dir: bool) -> bool {
-        if self.dir_only && !is_dir {
+        if self.never || (self.dir_only && !is_dir) {
             return false;
         }
+        let m = |t: &[u8]| if self.wild { wildmatch(&self.pat, t) } else { self.pat == t };
         if self.anchored {
-            return wildmatch(&self.pat, rel);
+            return m(rel);
+        }
+        if self.wild2_prefix {
+            return wildmatch(&self.pat, &[b"/", rel].concat());
         }
         if self.wild2 {
             return wildmatch(&self.pat, rel)
@@ -170,12 +189,31 @@ impl Rule {
                 }
             }
         }
-        wildmatch(&self.pat, &rel[start..])
+        m(&rel[start..])
     }
 }
 
+/// Whether every bracket expression is complete and there's no trailing
+/// backslash; rsync's matcher gives up on other patterns.
+fn well_formed(p: &[u8]) -> bool {
+    let mut i = 0;
+    while i < p.len() {
+        i += match p[i] {
+            b'\\' if i + 1 == p.len() => return false,
+            b'\\' => 2,
+            b'[' => match class(&p[i..], 0) {
+                Some((_, len)) => len,
+                None => return false,
+            },
+            _ => 1,
+        };
+    }
+    true
+}
+
 /// Shell-style matching where "*" and "?" don't match "/", "**" matches
-/// anything, "[...]" is a character class and "\" escapes the next character.
+/// anything, "[...]" is a bracket expression (with named classes such as
+/// "[:digit:]") and "\" escapes the next character. Like rsync's wildmatch.
 pub fn wildmatch(p: &[u8], t: &[u8]) -> bool {
     let (mut pi, mut ti) = (0, 0);
     while pi < p.len() {
@@ -208,24 +246,18 @@ pub fn wildmatch(p: &[u8], t: &[u8]) -> bool {
                 ti += 1;
                 pi += 1;
             }
-            b'[' => match class(&p[pi..], t.get(ti).copied()) {
-                Some((ok, len)) => {
-                    if !ok {
-                        return false;
+            b'[' => {
+                let Some(&c) = t.get(ti) else { return false };
+                match class(&p[pi..], c) {
+                    Some((true, len)) => {
+                        ti += 1;
+                        pi += len;
                     }
-                    ti += 1;
-                    pi += len;
+                    _ => return false,
                 }
-                None => {
-                    if t.get(ti) != Some(&b'[') {
-                        return false;
-                    }
-                    ti += 1;
-                    pi += 1;
-                }
-            },
-            b'\\' if pi + 1 < p.len() => {
-                if t.get(ti) != Some(&p[pi + 1]) {
+            }
+            b'\\' => {
+                if pi + 1 == p.len() || t.get(ti) != Some(&p[pi + 1]) {
                     return false;
                 }
                 ti += 1;
@@ -244,9 +276,9 @@ pub fn wildmatch(p: &[u8], t: &[u8]) -> bool {
 }
 
 /// Matches a bracket expression at the start of `p` against `c`. Returns
-/// whether it matched and the expression's length, or None if `p` doesn't
-/// start a complete bracket expression.
-fn class(p: &[u8], c: Option<u8>) -> Option<(bool, usize)> {
+/// whether it matched and the expression's length, or None if it's
+/// malformed: unterminated, or with an unknown "[:class:]".
+fn class(p: &[u8], c: u8) -> Option<(bool, usize)> {
     let mut i = 1;
     let negate = matches!(p.get(1), Some(b'!' | b'^'));
     if negate {
@@ -258,6 +290,16 @@ fn class(p: &[u8], c: Option<u8>) -> Option<(bool, usize)> {
         let ch = *p.get(i)?;
         if ch == b']' && i > first {
             break;
+        }
+        // A named class, "[:digit:]". Without the closing ":]" it's a plain
+        // "[" (rsync looks for the class name up to the next "]").
+        if ch == b'[' && p.get(i + 1) == Some(&b':') {
+            let end = i + 2 + p[i + 2..].iter().position(|&x| x == b']')?;
+            if end > i + 2 && p[end - 1] == b':' {
+                hit |= named_class(&p[i + 2..end - 1], c)?;
+                i = end + 1;
+                continue;
+            }
         }
         let lo = if ch == b'\\' {
             i += 1;
@@ -275,12 +317,31 @@ fn class(p: &[u8], c: Option<u8>) -> Option<(bool, usize)> {
             hi = *p.get(i)?;
             i += 1;
         }
-        if c.is_some_and(|c| lo <= c && c <= hi) {
+        if lo <= c && c <= hi {
             hit = true;
         }
     }
-    let ok = c.is_some_and(|c| c != b'/') && hit != negate;
-    Some((ok, i + 1))
+    Some((c != b'/' && hit != negate, i + 1))
+}
+
+/// Whether `c` is in the named class (ASCII, as in the C locale), or None
+/// for an unknown name.
+fn named_class(name: &[u8], c: u8) -> Option<bool> {
+    Some(match name {
+        b"alnum" => c.is_ascii_alphanumeric(),
+        b"alpha" => c.is_ascii_alphabetic(),
+        b"blank" => c == b' ' || c == b'\t',
+        b"cntrl" => c.is_ascii_control(),
+        b"digit" => c.is_ascii_digit(),
+        b"graph" => c.is_ascii_graphic(),
+        b"lower" => c.is_ascii_lowercase(),
+        b"print" => c.is_ascii_graphic() || c == b' ',
+        b"punct" => c.is_ascii_punctuation(),
+        b"space" => matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'),
+        b"upper" => c.is_ascii_uppercase(),
+        b"xdigit" => c.is_ascii_hexdigit(),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -309,7 +370,71 @@ mod tests {
         assert!(wildmatch(b"\\*", b"*"));
         assert!(!wildmatch(b"\\*", b"a"));
         assert!(wildmatch(b"a/**/b", b"a/x/y/b"));
-        assert!(wildmatch(b"[x", b"[x"));
+        assert!(wildmatch(b"[]]", b"]"));
+        assert!(wildmatch(b"[!]]", b"x"));
+        assert!(wildmatch(b"[a-]", b"-"));
+    }
+
+    #[test]
+    fn named_classes() {
+        assert!(wildmatch(b"[[:digit:]]*", b"1foo"));
+        assert!(!wildmatch(b"[[:digit:]]*", b"foo"));
+        assert!(wildmatch(b"[![:digit:]]*", b"foo"));
+        assert!(wildmatch(b"[^[:digit:]]*", b"foo"));
+        assert!(wildmatch(b"[[:digit:][:upper:]]x", b"Ax"));
+        assert!(wildmatch(b"[[:space:]]", b"\x0b"));
+        assert!(wildmatch(b"[[:punct:]]", b"-"));
+        assert!(!wildmatch(b"[[:alpha:]]", b"/"));
+        // After a class, "-" is literal.
+        assert!(wildmatch(b"[[:digit:]-z]", b"-"));
+        assert!(!wildmatch(b"[[:digit:]-z]", b"m"));
+        // Without ":]" it's a plain "[" in the set.
+        assert!(wildmatch(b"[[:x]", b":"));
+    }
+
+    #[test]
+    fn malformed_never_matches() {
+        // rsync's matcher gives up on these, so they match nothing.
+        for p in ["[x", "a*[x", "[[:digit:]", "[[:nope:]]", "[[::]]", "x*\\"] {
+            let f = f(&[&format!("- {p}")]);
+            for t in ["[x", "a[x", "x", "1", "x\\", ":"] {
+                assert!(!f.excluded(t.as_bytes(), false), "{p} matched {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn backslash_literal_without_wildcards() {
+        // A backslash is only an escape in a pattern with wildcards.
+        let r = f(&["- foo\\bar"]);
+        assert!(r.excluded(b"foo\\bar", false));
+        assert!(r.excluded(b"d/foo\\bar", false));
+        assert!(!r.excluded(b"foobar", false));
+        let r = f(&["- /x\\y"]);
+        assert!(r.excluded(b"x\\y", false));
+        assert!(!r.excluded(b"xy", false));
+        let r = f(&["- foo\\b*"]);
+        assert!(r.excluded(b"foobar", false));
+        assert!(!r.excluded(b"foo\\bar", false));
+        // "dir/***" has wildcards, so its backslashes are escapes, for the
+        // directory itself too.
+        let r = f(&["- a\\b/***"]);
+        assert!(r.excluded(b"ab", true));
+        assert!(r.excluded(b"ab/c", false));
+        assert!(!r.excluded(b"a\\b", true));
+    }
+
+    #[test]
+    fn double_star_prefix() {
+        // rsync matches "**..." against "/" + the path, so "**/x" matches a
+        // top-level "x" too.
+        let r = f(&["- **/node_modules"]);
+        assert!(r.excluded(b"node_modules", true));
+        assert!(r.excluded(b"a/b/node_modules", true));
+        assert!(!r.excluded(b"node_modules2", true));
+        let r = f(&["- **/a/b"]);
+        assert!(r.excluded(b"a/b", false));
+        assert!(r.excluded(b"x/a/b", false));
     }
 
     #[test]

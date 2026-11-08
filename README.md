@@ -240,7 +240,8 @@ only exits on its own with `--exit-on-error` (code 11).
 
 ```sh
 cargo test                        # filter matching, path ordering, parsing
-tests/vs-rsync.sh                 # same results as rsync for 16 filter/delete cases
+tests/vs-rsync.sh                 # same results as rsync for 19 filter/delete cases
+tests/patterns-vs-rsync.py        # same matches as rsync for 76 awkward patterns ([[:digit:]], \, **, ...)
 unshare -Urm tests/watch-test.sh  # watch mode, 26 scenarios on a tmpfs source
 unshare -Urm tests/fuzz-watch.sh  # random concurrent changes while watching, then an exact comparison
 unshare -Urm tests/safety-test.sh # unmounted/empty source, mounts in the destination, ...
