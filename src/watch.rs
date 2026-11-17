@@ -17,9 +17,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::time::{Duration, Instant};
 
 pub enum Ev {
     /// A path, relative to a pair's source, that changed.
@@ -29,8 +30,108 @@ pub enum Ev {
     /// A file whose link count changed, or that is multiply linked: its
     /// inode number on the pair's filesystem. All its names get synced.
     Links(usize, u64),
-    /// The kernel dropped events, so only a full pass is safe.
-    Overflow,
+    /// Events were dropped (by the kernel, or because too many changes
+    /// piled up), so only a full pass is safe. Says why.
+    Overflow(&'static str),
+}
+
+/// Changes waiting for the main thread, merged as they come in: one entry
+/// per changed path however many events it gets, so while the main thread is
+/// busy with a long pass, memory grows with the number of different paths
+/// changed (up to `MAX_QUEUED`), not with the number of events.
+#[derive(Default)]
+struct Batch {
+    dirty: HashMap<(usize, Vec<u8>), u8>,
+    moves: Vec<(usize, Vec<u8>, Vec<u8>)>,
+    links: std::collections::HashSet<(usize, u64)>,
+    overflow: Option<&'static str>,
+}
+
+/// Beyond this many queued paths, a full pass is cheaper to track.
+pub const MAX_QUEUED: usize = 1_000_000;
+/// Renames beyond this many are still synced, just not mirrored as renames.
+pub const MAX_MOVES: usize = 100_000;
+
+impl Batch {
+    fn add(&mut self, ev: Ev) {
+        if self.overflow.is_some() {
+            return;
+        }
+        match ev {
+            Ev::Dirty(p, rel, f) => {
+                *self.dirty.entry((p, rel)).or_insert(0) |= f;
+                if self.dirty.len() > MAX_QUEUED {
+                    *self = Batch { overflow: Some("too many changed paths piled up"), ..Batch::default() };
+                }
+            }
+            Ev::Move(p, old, new) => {
+                if self.moves.len() < MAX_MOVES {
+                    self.moves.push((p, old, new));
+                }
+            }
+            Ev::Links(p, ino) => {
+                self.links.insert((p, ino));
+            }
+            Ev::Overflow(why) => *self = Batch { overflow: Some(why), ..Batch::default() },
+        }
+    }
+
+    /// Renames stay in order; everything else is order-independent.
+    fn into_events(self) -> Vec<Ev> {
+        if let Some(why) = self.overflow {
+            return vec![Ev::Overflow(why)];
+        }
+        let mut v: Vec<Ev> = self.moves.into_iter().map(|(p, o, n)| Ev::Move(p, o, n)).collect();
+        v.extend(self.links.into_iter().map(|(p, i)| Ev::Links(p, i)));
+        v.extend(self.dirty.into_iter().map(|((p, r), f)| Ev::Dirty(p, r, f)));
+        v
+    }
+}
+
+/// The watcher's end of the queue.
+pub struct Sink {
+    batch: Arc<Mutex<Batch>>,
+    wake: SyncSender<()>,
+}
+
+/// The main thread's end of the queue.
+pub struct Events {
+    batch: Arc<Mutex<Batch>>,
+    wake: Receiver<()>,
+}
+
+pub fn queue() -> (Sink, Events) {
+    let batch = Arc::new(Mutex::new(Batch::default()));
+    let (tx, rx) = mpsc::sync_channel(1);
+    (Sink { batch: batch.clone(), wake: tx }, Events { batch, wake: rx })
+}
+
+impl Sink {
+    /// Queues events; false once the main thread is gone.
+    fn push(&self, evs: Vec<Ev>) -> bool {
+        let mut b = self.batch.lock().unwrap();
+        for ev in evs {
+            b.add(ev);
+        }
+        drop(b);
+        !matches!(self.wake.try_send(()), Err(TrySendError::Disconnected(_)))
+    }
+}
+
+impl Events {
+    /// Waits up to `d` for changes and takes everything queued. Disconnected
+    /// once the watcher has stopped and its last changes were taken.
+    pub fn recv_timeout(&self, d: Duration) -> Result<Vec<Ev>, RecvTimeoutError> {
+        let r = self.wake.recv_timeout(d);
+        if matches!(r, Err(RecvTimeoutError::Timeout)) {
+            return Err(RecvTimeoutError::Timeout);
+        }
+        let evs = std::mem::take(&mut *self.batch.lock().unwrap()).into_events();
+        match r {
+            Err(e) if evs.is_empty() => Err(e),
+            _ => Ok(evs),
+        }
+    }
 }
 
 struct Root {
@@ -210,7 +311,7 @@ impl Watcher {
         dlog!("fanotify: indexed {} directories in {:?}", idx.nodes.len(), t0.elapsed());
     }
 
-    pub fn run(mut self, tx: Sender<Vec<Ev>>, stop: Arc<AtomicBool>) {
+    pub fn run(mut self, sink: Sink, stop: Arc<AtomicBool>) {
         self.rebuild_index();
         let mut buf = vec![0u64; 256 * 1024 / 8];
         let cap = buf.len() * 8;
@@ -224,12 +325,17 @@ impl Watcher {
             let mut cache: HashMap<Vec<u8>, Located> = HashMap::new();
             self.rebuilt = false;
             let mut out = Vec::new();
+            let t0 = Instant::now();
+            let mut drained = false;
             loop {
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, cap) };
                 if n < 0 {
                     let e = io::Error::last_os_error();
                     match e.raw_os_error() {
-                        Some(libc::EAGAIN) => break,
+                        Some(libc::EAGAIN) => {
+                            drained = true;
+                            break;
+                        }
                         Some(libc::EINTR) => continue,
                         _ => {
                             log!("error: reading fanotify events failed: {e}");
@@ -240,15 +346,24 @@ impl Watcher {
                 let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, n as usize) };
                 self.parse(bytes, &mut cache, &mut out);
                 if (n as usize) < cap / 2 {
+                    drained = true;
+                    break;
+                }
+                // In a sustained burst the queue never runs dry: hand over
+                // what there is every so often anyway.
+                if t0.elapsed() >= Duration::from_millis(200) {
                     break;
                 }
             }
-            if !out.is_empty() && tx.send(out).is_err() {
+            if !out.is_empty() && !sink.push(out) {
                 return;
             }
             // Give the kernel a moment to merge repeats (say, many small writes
-            // to one file) into single events before reading again.
-            std::thread::sleep(Duration::from_millis(100));
+            // to one file) into single events before reading again, unless
+            // it's busy.
+            if drained {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 
@@ -276,7 +391,7 @@ impl Watcher {
 
     fn event(&mut self, mask: u64, mut info: &[u8], cache: &mut HashMap<Vec<u8>, Located>, out: &mut Vec<Ev>) {
         if mask & libc::FAN_Q_OVERFLOW != 0 {
-            out.push(Ev::Overflow);
+            out.push(Ev::Overflow("the kernel's event queue overflowed"));
             return;
         }
         let (mut main, mut old, mut new, mut target) = (None, None, None, None);

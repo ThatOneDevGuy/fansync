@@ -202,7 +202,20 @@ pub struct Settings {
     pub exit_on_error: bool,
 }
 
+/// glibc gives each thread its own memory arena. Full passes allocate on
+/// many threads, and what they keep ends up scattered over all the arenas,
+/// whose free space can't be handed back to the system: fansync grew a few
+/// MB with every full pass. Two arenas keep it flat, for about 3% of pass
+/// time. Has to happen before any thread starts; MALLOC_ARENA_MAX overrides it.
+fn limit_arenas() {
+    #[cfg(target_env = "gnu")]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+    }
+}
+
 fn main() {
+    limit_arenas();
     let code = match run() {
         Ok(c) => c,
         Err(e) => {

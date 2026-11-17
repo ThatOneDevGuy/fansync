@@ -5,12 +5,12 @@
 use crate::Settings;
 use crate::engine::{ENTRY, Engine, Outcome, PairState, SELF, Snap, Stats};
 use crate::util::{dur, size};
-use crate::watch::{Ev, Watcher};
+use crate::watch::{self, Ev, Events, MAX_MOVES, MAX_QUEUED, Watcher};
 use crate::{log, vlog};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -19,8 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// cycle instead of being copied over and over.
 const COOL_FACTOR: u32 = 10;
 /// Beyond this many queued paths, a full pass is cheaper to track.
-const MAX_DIRTY: usize = 1_000_000;
-const MAX_MOVES: usize = 100_000;
+const MAX_DIRTY: usize = MAX_QUEUED;
 
 /// rsync's exit code for "error in file I/O": a pass failed as a whole.
 const EXIT_FAILED: i32 = 11;
@@ -96,6 +95,7 @@ fn full_pass(eng: &Engine, ps: &PairState, set: &Settings, why: &str, status: &S
         done.set();
         r
     });
+    release_memory();
     let d = eng.stats.snap().since(&before);
     match res {
         Ok(o) => {
@@ -115,6 +115,17 @@ fn full_pass(eng: &Engine, ps: &PairState, set: &Settings, why: &str, status: &S
             log!("error: {}: {e}", p.name);
             Err(format!("{}: {e}", p.name))
         }
+    }
+}
+
+/// Hands memory freed by a pass back to the system. glibc's allocator keeps
+/// freed memory in per-thread arenas, so without this fansync would stay as
+/// big as its biggest pass (and creep up from there), however little it
+/// keeps between passes.
+fn release_memory() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 
@@ -217,17 +228,17 @@ pub fn run(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
     // Watching starts before the initial pass, so nothing that changes
     // during it is missed.
     let mut watched = vec![false; n];
-    let mut rx: Option<Receiver<Vec<Ev>>> = None;
+    let mut rx: Option<Events> = None;
     if !set.no_watch {
         let srcs: Vec<(usize, PathBuf)> = states.iter().enumerate().map(|(i, s)| (i, s.pair.src.clone())).collect();
         match Watcher::new(&srcs, n) {
             Ok(w) => {
                 watched = w.watched.clone();
-                let (tx, r) = mpsc::channel();
+                let (sink, r) = watch::queue();
                 let stop = eng.stop.clone();
                 std::thread::Builder::new()
                     .name("fanotify".into())
-                    .spawn(move || w.run(tx, stop))
+                    .spawn(move || w.run(sink, stop))
                     .expect("spawning thread");
                 rx = Some(r);
             }
@@ -274,10 +285,7 @@ pub fn run(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
         let mut batches = Vec::new();
         match &rx {
             Some(r) => match r.recv_timeout(timeout) {
-                Ok(b) => {
-                    batches.push(b);
-                    batches.extend(r.try_iter());
-                }
+                Ok(b) => batches.push(b),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     rx = None;
@@ -402,8 +410,8 @@ fn absorb(
                 }
                 p.mark(now);
             }
-            Ev::Overflow => {
-                log!("warning: the kernel's event queue overflowed; doing a full pass of everything watched");
+            Ev::Overflow(why) => {
+                log!("warning: {why}; doing a full pass of everything watched");
                 for (i, p) in pend.iter_mut().enumerate() {
                     if watched[i] {
                         p.dirty = HashMap::new();
@@ -447,7 +455,11 @@ fn process(
         let count = dirty.len();
         let before = eng.stats.snap();
         let t0 = Instant::now();
-        match eng.sync_paths(ps, dirty.into_iter().collect(), moves, links.into_iter().collect()) {
+        let res = eng.sync_paths(ps, dirty.into_iter().collect(), moves, links.into_iter().collect());
+        if count >= 10_000 {
+            release_memory();
+        }
+        match res {
             Ok(o) => {
                 let d = eng.stats.snap().since(&before);
                 if d.changes() > 0 || d.errors > 0 {

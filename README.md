@@ -219,6 +219,17 @@ On a 9.6 GB, 205k-entry tree (warm cache, NVMe):
   so a hard link that is created, used and removed within about 0.1 s is
   only caught by the `link_delay` pass.
 
+## Memory
+
+Between passes fansync keeps what it needs to link hard links right away:
+the directory of every file, and the full names of every hard-linked one.
+That's about 100–150 MB per million files, measured with a quarter of them
+hard-linked (each hard-linked name costs a few hundred bytes, other files
+a few dozen). It stays flat however long fansync runs: the records are
+rebuilt by each full pass, changes waiting to be synced are merged per path
+and capped at a million paths (beyond that, a full pass runs instead), and
+memory freed after a pass is handed back to the system.
+
 ## Monitoring
 
 `--status-file FILE` keeps a file of shell `KEY='value'` lines up to date:
@@ -248,4 +259,6 @@ unshare -Urm tests/safety-test.sh # unmounted/empty source, mounts in the destin
 tests/mktree.py DIR && fansync --once SRC/ DST/ && tests/treecmp.py SRC DST
 tests/vm.sh tests/vm-tests.sh     # all of it as real root in a QEMU VM, plus ext4, btrfs subvolumes
                                   # and failing drives (device-mapper)
+tests/vm.sh tests/memory-soak.sh  # memory over many full passes with nonstop changes (BULK=N for size)
+tests/vm.sh tests/event-burst-test.sh  # memory and sync delay under a flood of file events
 ```

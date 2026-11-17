@@ -334,8 +334,11 @@ impl Engine {
                 ps.pair.dst.display()
             )));
         }
+        // Both are rebuilt by the pass, which never reads the old ones;
+        // dropping them now keeps two copies from being alive at once.
         if self.opts.hard_links && !self.opts.dry_run {
             ps.inodes.clear();
+            *ps.hardlinks.lock().unwrap() = LinkMap::default();
         }
         run.sync_root(true);
         run.finish_hardlinks();
