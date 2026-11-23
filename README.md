@@ -278,3 +278,7 @@ tests/vm.sh tests/event-burst-test.sh  # memory and sync delay under a flood of 
 machine's filesystem shared read-only, and runs a command there as real root.
 It needs `qemu-system-x86`, `busybox-static` and `zstd`, and the btrfs,
 failing-drive and memory tests also use `btrfs-progs`, `dmsetup` and `gdb`.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
