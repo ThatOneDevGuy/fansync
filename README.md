@@ -21,12 +21,20 @@ deletions):
 - rsync filter rules: `--exclude`/`--include` with the same pattern syntax,
   and excluded destination files are never deleted
 
+## Install
+
+It needs Linux and Rust 1.88 or newer ([rustup.rs](https://rustup.rs)):
+
+```sh
+git clone https://github.com/ThatOneDevGuy/fansync.git
+cd fansync
+cargo build --release
+sudo install target/release/fansync /usr/local/bin/
+```
+
 ## Usage
 
 ```sh
-cargo build --release
-sudo install target/release/fansync /usr/local/bin/
-
 # One pair, rsync style: initial pass, then keep watching (Ctrl-C to stop).
 sudo fansync --delete --exclude='/tmp/*' /data/ /mnt/backup/data/
 
@@ -77,9 +85,12 @@ rules = ["+ /log/keep-this", "- /log/*"]   # ordered "+ "/"- " rules, like rsync
 Within a pair, rules apply in this order: `rules`, then `include`, then
 `exclude`, then `exclude_from` (a file of rules). The first match wins.
 
-`examples/sync-to-renegade.sh` is the drive-sync script rewritten to generate
-this config from its step list and run fansync. `examples/watch-sync.sh` is its
-monitor, reading the status file instead of looking for rsync processes.
+`example-scripts/` holds the rsync scripts fansync was written to replace: a
+backup of a running system's btrfs subvolumes to a second drive, and its
+monitor. `examples/` has both rewritten for fansync: `sync-to-renegade.sh`
+generates a config like the one above from its list of steps and runs
+fansync, and `watch-sync.sh` reads the status file instead of looking for
+rsync processes.
 
 ## How it stays fast
 
@@ -262,3 +273,8 @@ tests/vm.sh tests/vm-tests.sh     # all of it as real root in a QEMU VM, plus ex
 tests/vm.sh tests/memory-soak.sh  # memory over many full passes with nonstop changes (BULK=N for size)
 tests/vm.sh tests/event-burst-test.sh  # memory and sync delay under a flood of file events
 ```
+
+`tests/vm.sh` boots the installed kernel in QEMU (KVM isn't needed) with this
+machine's filesystem shared read-only, and runs a command there as real root.
+It needs `qemu-system-x86`, `busybox-static` and `zstd`, and the btrfs,
+failing-drive and memory tests also use `btrfs-progs`, `dmsetup` and `gdb`.

@@ -2,6 +2,9 @@
 name = "fansync"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Keeps directory trees mirrored: an rsync-style pass, then fanotify-driven sync of each change"
+repository = "https://github.com/ThatOneDevGuy/fansync"
 
 [dependencies]
 anyhow = "1.0.104"
