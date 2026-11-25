@@ -252,6 +252,65 @@ impl InoIndex {
     }
 }
 
+/// btrfs records every name of an inode (a back reference per link), so
+/// on a btrfs source an inode's names are looked up directly: no index of
+/// single-linked files, and no full pass to find names it missed. Names
+/// outside the pair or excluded are seen too, and known to need nothing.
+struct BtrfsNames {
+    /// The source directory's path inside its subvolume: "" or "a/b/".
+    prefix: Vec<u8>,
+    /// Directory paths looked up in this pass, by inode.
+    dirs: Mutex<HashMap<u64, Vec<u8>>>,
+}
+
+impl BtrfsNames {
+    /// None unless `src` is on btrfs and the lookups are allowed (they
+    /// need CAP_SYS_ADMIN).
+    fn new(src: RawFd) -> Option<BtrfsNames> {
+        if !sys::is_btrfs(src) {
+            return None;
+        }
+        let ino = sys::fstat(src).ok()?.ino;
+        let prefix = sys::btrfs_dir_path(src, ino).ok()?;
+        sys::btrfs_links(src, ino).ok()?;
+        Some(BtrfsNames { prefix, dirs: Mutex::new(HashMap::new()) })
+    }
+
+    /// The names of inode `ino` inside the pair that aren't excluded, and
+    /// whether that's all of them that matter (false if some couldn't be
+    /// looked up). None if btrfs can't say.
+    fn names(&self, src: RawFd, ino: u64, filter: &Filter) -> Option<(Vec<Box<[u8]>>, bool)> {
+        let links = sys::btrfs_links(src, ino).ok()?;
+        let mut out = Vec::new();
+        let mut complete = true;
+        for (dir, name) in links {
+            let cached = self.dirs.lock().unwrap().get(&dir).cloned();
+            let mut path = match cached {
+                Some(p) => p,
+                None => match sys::btrfs_dir_path(src, dir) {
+                    Ok(p) => {
+                        self.dirs.lock().unwrap().insert(dir, p.clone());
+                        p
+                    }
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                },
+            };
+            path.extend_from_slice(&name);
+            // Outside the source directory, or excluded: nothing to link.
+            if let Some(rel) = path.strip_prefix(&self.prefix[..])
+                && !rel.is_empty()
+                && !filter.excluded_path(rel, false)
+            {
+                out.push(rel.into());
+            }
+        }
+        Some((out, complete))
+    }
+}
+
 /// What is known about one multiply-linked source file.
 struct Group {
     paths: Vec<Box<[u8]>>,
@@ -560,6 +619,8 @@ struct Run<'a> {
     abort: AtomicBool,
     abort_why: Mutex<Option<String>>,
     links_unknown: AtomicBool,
+    /// On btrfs, an inode's names are looked up instead of searched for.
+    btrfs: Option<BtrfsNames>,
     /// Multiply-linked files met in this pass, synced together at the end.
     hl: Mutex<Links>,
     /// Destination directories whose mtime may need restoring.
@@ -626,6 +687,7 @@ impl<'a> Run<'a> {
         }
         let src_mnt = sys::mount_id(src_root.as_raw_fd()).ok();
         let dst_mnt = dst_root.as_ref().and_then(|d| sys::mount_id(d.as_raw_fd()).ok());
+        let btrfs = if e.opts.hard_links { BtrfsNames::new(src_root.as_raw_fd()) } else { None };
         Ok(Run {
             e,
             ps,
@@ -641,6 +703,7 @@ impl<'a> Run<'a> {
             abort: AtomicBool::new(false),
             abort_why: Mutex::new(None),
             links_unknown: AtomicBool::new(false),
+            btrfs,
             hl: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashSet::new()),
             escalate: Mutex::new(HashSet::new()),
@@ -882,7 +945,7 @@ impl<'a> Run<'a> {
                 false
             }
             libc::S_IFREG => {
-                if self.e.opts.hard_links && !self.dry() {
+                if self.e.opts.hard_links && !self.dry() && self.btrfs.is_none() {
                     self.ps.inodes.record(st.ino, split(rel).0);
                 }
                 self.sync_file(sdir, ddir, name, st, rel, dst)
@@ -1800,17 +1863,23 @@ impl<'a> Run<'a> {
                 // During a full pass every name inside the pair is seen. In
                 // an incremental one, a link count that went up past the
                 // names we know means a new link to a file that had a single
-                // name until now: find that name through the inode index.
-                if !self.full && now > before && now > v.len() as u64 {
-                    let found = self.find_links(k.1, &v, &listings);
+                // name until now: find that name through the inode index. On
+                // btrfs, look up all its names whenever some are missing:
+                // the rest are then known to be outside the pair or excluded.
+                // (A link made after this has its own event.)
+                let mut complete = self.btrfs.is_some();
+                let missing = now > v.len() as u64 && (self.btrfs.is_some() || now > before);
+                if !self.full && missing {
+                    let (found, c) = self.find_links(k.1, &v, &listings);
                     v.extend(found);
+                    complete = c;
                 }
                 v.sort_by(|a, b| cmp_path(a, b));
                 v.dedup();
                 let (paths, nlink) = self.sync_link_group(k, v);
                 // Still names we don't know (stale index, or a name outside
                 // this pair): a full pass later links whatever it can find.
-                if !self.full && nlink > before && nlink > paths.len() as u64 {
+                if !self.full && !complete && nlink > before && nlink > paths.len() as u64 {
                     vlog!("{}: {} has hard links fansync doesn't know yet", self.ps.pair.name, show(&paths[0]));
                     self.links_unknown.store(true, Relaxed);
                 }
@@ -1868,7 +1937,7 @@ impl<'a> Run<'a> {
             let k = (self.src_dev, ino);
             let mut names =
                 self.ps.hardlinks.lock().unwrap().groups.get(&k).map(|g| g.paths.clone()).unwrap_or_default();
-            let more = self.find_links(ino, &names, &listings);
+            let (more, _) = self.find_links(ino, &names, &listings);
             names.extend(more);
             if !names.is_empty() {
                 self.hl.lock().unwrap().entry(k).or_default().0.extend(names);
@@ -1876,18 +1945,24 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Other names of inode `ino`, from the directory the inode index says
-    /// it lived in while it had a single link. `listings` caches directory
-    /// contents for the pass, so linking a whole tree (cp -al) reads each
-    /// directory once.
+    /// Other names of inode `ino` inside the pair, and whether they're
+    /// surely all of them. On btrfs they're looked up; elsewhere they're
+    /// found in the directory the inode index says the file lived in while
+    /// it had a single link. `listings` caches directory contents for the
+    /// pass, so linking a whole tree (cp -al) reads each directory once.
     #[allow(clippy::type_complexity)]
     fn find_links(
         &self,
         ino: u64,
         known: &[Box<[u8]>],
         listings: &Mutex<HashMap<Arc<[u8]>, Arc<Vec<(u64, CString)>>>>,
-    ) -> Vec<Box<[u8]>> {
-        let Some(dir) = self.ps.inodes.dir_of(ino) else { return Vec::new() };
+    ) -> (Vec<Box<[u8]>>, bool) {
+        if let Some(b) = &self.btrfs
+            && let Some((names, complete)) = b.names(self.src_root.as_raw_fd(), ino, self.filter)
+        {
+            return (names.into_iter().filter(|r| !known.contains(r)).collect(), complete);
+        }
+        let Some(dir) = self.ps.inodes.dir_of(ino) else { return (Vec::new(), false) };
         let cached = listings.lock().unwrap().get(&dir).cloned();
         let list = match cached {
             Some(l) => l,
@@ -1900,11 +1975,13 @@ impl<'a> Run<'a> {
                 l
             }
         };
-        list.iter()
+        let found = list
+            .iter()
             .filter(|(i, _)| *i == ino)
             .map(|(_, n)| join(&dir, n.to_bytes()).into_boxed_slice())
             .filter(|r| !known.contains(r) && !self.filter.excluded_path(r, false))
-            .collect()
+            .collect();
+        (found, false)
     }
 
     /// Returns the paths that still belong to the group, and its link count.

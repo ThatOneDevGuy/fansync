@@ -516,6 +516,123 @@ pub fn xremove(t: Xt, name: &CStr) -> Res<()> {
     .map(drop)
 }
 
+pub fn is_btrfs(fd: RawFd) -> bool {
+    // f_type's type differs between architectures; the magic fits in 32 bits.
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+    let mut s = MaybeUninit::<libc::statfs>::uninit();
+    cvt(unsafe { libc::fstatfs(fd, s.as_mut_ptr()) }).is_ok()
+        && unsafe { s.assume_init() }.f_type as u32 == BTRFS_SUPER_MAGIC
+}
+
+// btrfs ioctls (include/uapi/linux/btrfs.h): _IOWR(0x94, nr, size).
+const BTRFS_IOC_TREE_SEARCH_V2: libc::c_ulong = 0xC070_9411;
+const BTRFS_IOC_INO_LOOKUP: libc::c_ulong = 0xD000_9412;
+
+#[repr(C)]
+struct BtrfsSearchKey {
+    tree_id: u64,
+    min_objectid: u64,
+    max_objectid: u64,
+    min_offset: u64,
+    max_offset: u64,
+    min_transid: u64,
+    max_transid: u64,
+    min_type: u32,
+    max_type: u32,
+    nr_items: u32,
+    unused: [u32; 9],
+}
+
+#[repr(C)]
+struct BtrfsInoLookup {
+    tree_id: u64,
+    objectid: u64,
+    name: [u8; 4080],
+}
+
+/// The path of directory `dir` inside the btrfs subvolume that `fd` is on:
+/// "" for the subvolume's root, otherwise "a/b/". Needs CAP_SYS_ADMIN.
+pub fn btrfs_dir_path(fd: RawFd, dir: u64) -> Res<Vec<u8>> {
+    let mut a = Box::new(BtrfsInoLookup { tree_id: 0, objectid: dir, name: [0; 4080] });
+    cvt(unsafe { libc::ioctl(fd, BTRFS_IOC_INO_LOOKUP, &mut *a as *mut BtrfsInoLookup) })?;
+    let n = a.name.iter().position(|&c| c == 0).unwrap_or(a.name.len());
+    let mut p = a.name[..n].to_vec();
+    if !p.is_empty() && !p.ends_with(b"/") {
+        p.push(b'/');
+    }
+    Ok(p)
+}
+
+/// Every name of inode `ino` in the btrfs subvolume that `fd` is on, as
+/// (directory inode, name): btrfs keeps a back reference for each link
+/// (INODE_REF items, and INODE_EXTREF ones for directories with very many
+/// links to one inode). Needs CAP_SYS_ADMIN.
+pub fn btrfs_links(fd: RawFd, ino: u64) -> Res<Vec<(u64, Vec<u8>)>> {
+    const INODE_REF: u32 = 12;
+    const INODE_EXTREF: u32 = 13;
+    const KEY: usize = size_of::<BtrfsSearchKey>();
+    let mut out = Vec::new();
+    let mut size = 64 * 1024;
+    let (mut min_type, mut min_offset) = (INODE_REF, 0u64);
+    loop {
+        let mut args = vec![0u64; (KEY + 8 + size).div_ceil(8)];
+        let key = BtrfsSearchKey {
+            tree_id: 0,
+            min_objectid: ino,
+            max_objectid: ino,
+            min_offset,
+            max_offset: u64::MAX,
+            min_transid: 0,
+            max_transid: u64::MAX,
+            min_type,
+            max_type: INODE_EXTREF,
+            nr_items: u32::MAX,
+            unused: [0; 9],
+        };
+        unsafe { std::ptr::write(args.as_mut_ptr() as *mut BtrfsSearchKey, key) };
+        args[KEY / 8] = size as u64;
+        if let Err(e) = cvt(unsafe { libc::ioctl(fd, BTRFS_IOC_TREE_SEARCH_V2, args.as_mut_ptr()) }) {
+            // An item bigger than the buffer: the kernel says how big.
+            if e.raw_os_error() == Some(libc::EOVERFLOW) && (args[KEY / 8] as usize) > size {
+                size = args[KEY / 8] as usize;
+                continue;
+            }
+            return Err(e);
+        }
+        let n = unsafe { (*(args.as_ptr() as *const BtrfsSearchKey)).nr_items };
+        if n == 0 {
+            return Ok(out);
+        }
+        let b = unsafe { std::slice::from_raw_parts((args.as_ptr() as *const u8).add(KEY + 8), size) };
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let u16_at = |i: usize| u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as usize;
+        let mut pos = 0;
+        let mut last = (min_type, min_offset);
+        for _ in 0..n {
+            // struct btrfs_ioctl_search_header: transid, objectid, offset, type, len.
+            let (offset, typ) = (u64_at(pos + 16), u32::from_le_bytes(b[pos + 24..pos + 28].try_into().unwrap()));
+            let len = u32::from_le_bytes(b[pos + 28..pos + 32].try_into().unwrap()) as usize;
+            let (mut i, end) = (pos + 32, pos + 32 + len);
+            while i < end {
+                // btrfs_inode_ref: index, name_len, name (the key's offset is
+                // the directory); btrfs_inode_extref: dir, index, name_len, name.
+                let (dir, hdr) = if typ == INODE_REF { (offset, 10) } else { (u64_at(i), 18) };
+                let nl = u16_at(i + hdr - 2);
+                out.push((dir, b[i + hdr..i + hdr + nl].to_vec()));
+                i += hdr + nl;
+            }
+            last = (typ, offset);
+            pos = end;
+        }
+        // Go on after the last item found.
+        (min_type, min_offset) = match last {
+            (t, u64::MAX) if t >= INODE_EXTREF => return Ok(out),
+            (t, u64::MAX) => (t + 1, 0),
+            (t, o) => (t, o + 1),
+        };
+    }
+}
+
 pub fn fsid_of(fd: RawFd) -> Res<[i32; 2]> {
     let mut s = MaybeUninit::<libc::statfs>::uninit();
     cvt(unsafe { libc::fstatfs(fd, s.as_mut_ptr()) })?;

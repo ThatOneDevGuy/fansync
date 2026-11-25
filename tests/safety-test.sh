@@ -97,4 +97,30 @@ mount -o remount,bind,ro "$T/dst"; echo b > "$T/src/b"; ended
 [[ $rc == running ]] && grep -q "will retry" "$T/log" && [[ $(grep -c "^.*error:" "$T/log") == 1 ]] &&
   ok "without --exit-on-error: one error, keeps running and retries" || { bad "without --exit-on-error (rc $rc)"; tail -3 "$T/log"; }
 umount "$T/dst"
+
+# 12-13. Nothing is written to a destination before the status file says a
+#    pass is running: while it can't be written, passes wait (or, with
+#    --exit-on-error, fansync stops), and they resume once it can.
+watch_st() { # ARGS...: like watch_dst, with the status file on its own tmpfs
+  mkdir -p "$T/st"; mount -t tmpfs st "$T/st"
+  "$F" --settle 0.2 --status-file "$T/st/status" "$@" "$T/src/" "$T/dst/" > "$T/log" 2>&1 & pid=$!
+  for _ in $(seq 50); do grep -q "watching" "$T/log" && break; sleep 0.1; done
+}
+fresh; mount -t tmpfs s "$T/src"; mount -t tmpfs d "$T/dst"; echo a > "$T/src/a"
+watch_st --interval 0.05
+mount -o remount,bind,ro "$T/st"; echo b > "$T/src/b"; sleep 2
+if [[ ! -e $T/dst/b ]] && grep -q "not syncing while the status file can't be written" "$T/log" && kill -0 $pid; then
+  mount -o remount,bind,rw "$T/st"; sleep 5
+  [[ -e $T/dst/b ]] && grep -q "^state='watching'" "$T/st/status" &&
+    ok "status file can't be written: no pass until it can, then synced" || { bad "status file writable again: not synced"; tail -3 "$T/log"; }
+else
+  bad "status file can't be written: synced anyway, or no error logged"; tail -3 "$T/log"
+fi
+kill $pid 2>/dev/null; wait $pid 2>/dev/null
+fresh; mount -t tmpfs s "$T/src"; mount -t tmpfs d "$T/dst"; echo a > "$T/src/a"
+watch_st --exit-on-error
+mount -o remount,bind,ro "$T/st"; echo b > "$T/src/b"; ended
+[[ $rc == 11 && ! -e $T/dst/b ]] && grep -q "stopping, as --exit-on-error asks: .*status file" "$T/log" &&
+  ok "--exit-on-error: status file can't be written, fansync stops (exit $rc)" || { bad "--exit-on-error, status file (rc $rc)"; tail -3 "$T/log"; }
+fresh
 exit $fail

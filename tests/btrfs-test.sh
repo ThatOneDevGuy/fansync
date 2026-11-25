@@ -52,12 +52,14 @@ check "kernel: subvolume mark refused ($r1), top-level directory accepted ($r2)"
 # One pair per subvolume, all through the read-only top-level mount.
 cat > "$T/cfg.toml" <<EOF
 delete = true
+link_delay = 5
 [[pair]]
 src = "$T/ro/os/root/"
 dst = "$T/dst/root/"
 [[pair]]
 src = "$T/ro/os/home/"
 dst = "$T/dst/home/"
+exclude = ["/cache/"]
 [[pair]]
 src = "$T/ro/shared/data/"
 dst = "$T/dst/data/"
@@ -65,7 +67,7 @@ EOF
 start "$T/log" --config "$T/cfg.toml"
 check "all 3 subvolume pairs watched" 'grep -q "3 of 3 pairs through fanotify" "$T/log"'
 check "watched through the top level" 'grep -q "a btrfs subvolume, watched through $T/ro/os\$" "$T/log"'
-same() { python3 "$D/treecmp.py" "$1" "$2" --skip nested > /dev/null; }
+same() { python3 "$D/treecmp.py" "$1" "$2" --skip nested --skip cache > /dev/null; }
 synced() { same "$T/ro/os/root" "$T/dst/root" && same "$T/ro/os/home" "$T/dst/home" && same "$T/ro/shared/data" "$T/dst/data"; }
 check "initial pass" synced
 check "nested subvolume copied as an empty directory" '[[ -d $T/dst/root/nested && -z $(ls -A "$T/dst/root/nested") ]]'
@@ -82,6 +84,25 @@ check "rename mirrored, not copied again" 'grep -q "^\*moving *a => a2" "$T/log"
 echo z > "$T/sysroot/nested/more"; echo z2 > "$T/sysroot/rfile"
 sleep 2
 check "a change inside a nested subvolume stays out" '[[ ! -e $T/dst/root/nested/more ]] && synced'
+# Hard links. btrfs knows every name of an inode, so fansync looks them up:
+# names in an excluded directory, in one renamed since the last full pass,
+# or very many of them (INODE_EXTREF), need no full pass to find.
+h=$T/syshome
+mkdir -p "$h/cache" "$h/old" "$h/many"; echo c > "$h/cache/blob"; echo r > "$h/old/f"; echo m > "$h/many/base"
+sleep 2
+mkdir "$h/wt1" "$h/wt2"; ln "$h/cache/blob" "$h/wt1/blob"; ln "$h/cache/blob" "$h/wt2/blob"
+mv "$h/old" "$h/renamed"; ln "$h/renamed/f" "$h/linked-f"
+python3 -c 'import os, sys
+for i in range(1, 301): os.link(sys.argv[1] + "/base", sys.argv[1] + "/n%0100d" % i)' "$h/many"
+sleep 4
+ino() { stat -c %i "$T/dst/home/$1"; }
+check "links from an excluded cache: copied, and linked with each other" \
+  '[[ ! -e $T/dst/home/cache && $(ino wt1/blob) == $(ino wt2/blob) ]]'
+check "link to a file in a renamed directory, linked right away" '[[ $(ino linked-f) == $(ino renamed/f) ]]'
+check "300 long names for one file, all linked" \
+  '[[ $(stat -c %i "$T/dst/home/many/"* | sort -u | wc -l) == 1 && $(ls "$T/dst/home/many" | wc -l) == 301 ]] && synced'
+sleep 3
+check "no full pass needed to find hard links" '! grep -qE "new hard links|doesn.t know yet" "$T/log"'
 check "no periodic passes needed" '! grep -q "not watched" "$T/log"'
 stop
 

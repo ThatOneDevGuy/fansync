@@ -8,7 +8,8 @@
 # kept (resident grows, in use doesn't). Needs real root: run it in the VM.
 # Usage: tests/memory-soak.sh [MINUTES]   (HEAPTRACK=1 to record with heaptrack;
 # BULK=N for N more files, a fifth of them hard-linked, as flatpak and
-# container storage do; RESCAN=HOURS between full passes, default 0.01)
+# container storage do (LINKED=0: none); RESCAN=HOURS between full passes,
+# default 0.01)
 set -uo pipefail
 D=$(cd "$(dirname "$0")" && pwd)
 F=${F:-$D/../target/release/fansync}
@@ -33,7 +34,9 @@ PY
 if [[ -n ${BULK:-} ]]; then
   cc -O2 -o "$T/churn" "$D/churn.c" && "$T/churn" "$T/top/os/root/bulk" fill "$BULK"
   mkdir "$T/top/os/root/linked"
-  for k in $(seq 0 $((BULK / 5000 - 1))); do cp -al "$T/top/os/root/bulk/d$k" "$T/top/os/root/linked/"; done
+  if [[ ${LINKED:-1} != 0 ]]; then
+    for k in $(seq 0 $((BULK / 5000 - 1))); do cp -al "$T/top/os/root/bulk/d$k" "$T/top/os/root/linked/"; done
+  fi
   echo "source: $(find "$T/top/os" -type f | wc -l) files, $(find "$T/top/os" -type f -links +1 | wc -l) of them hard-linked"
 fi
 mount -o ro,subvolid=5 "$L" "$T/ro"

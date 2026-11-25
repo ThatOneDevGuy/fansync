@@ -33,8 +33,7 @@ pub fn run_once(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
         if eng.stop.load(Relaxed) {
             break;
         }
-        status.set(&[("state", "syncing"), ("pair", &ps.pair.name)], eng);
-        let o = full_pass(eng, ps, set, "", &status);
+        let o = status.begin_pass("syncing", &ps.pair.name, eng).and_then(|()| full_pass(eng, ps, set, "", &status));
         if let Some(code) = give_up(&o, set, &status, eng) {
             return code;
         }
@@ -196,6 +195,8 @@ struct Pending {
     hold: Option<Instant>,
     /// A full pass to re-link newly hard-linked files is due then.
     relink: Option<Instant>,
+    /// How long the last full pass took.
+    full_took: Duration,
 }
 
 impl Pending {
@@ -252,12 +253,14 @@ pub fn run(eng: &Engine, states: &[PairState], set: &Settings) -> i32 {
         if eng.stop.load(Relaxed) {
             return 0;
         }
-        status.set(&[("state", "initial-sync"), ("pair", &ps.pair.name)], eng);
-        let o = full_pass(eng, ps, set, "", &status);
+        let t0 = Instant::now();
+        let o =
+            status.begin_pass("initial-sync", &ps.pair.name, eng).and_then(|()| full_pass(eng, ps, set, "", &status));
+        pend[i].full_took = t0.elapsed();
         if let Some(code) = give_up(&o, set, &status, eng) {
             return code;
         }
-        after_pass(&mut pend[i], o, set, &cool[i]);
+        after_pass(&ps.pair.name, &mut pend[i], o, set, &cool[i]);
     }
     status.set(&[("state", "watching"), ("pair", ""), ("last_full_pass", &epoch())], eng);
 
@@ -435,6 +438,15 @@ fn process(
     set: &Settings,
     status: &Status,
 ) -> Option<i32> {
+    if let Err(why) = status.begin_pass("syncing", &ps.pair.name, eng) {
+        // Keep what's pending, and try again later.
+        if let Some(code) = give_up(&Err(why), set, status, eng) {
+            return Some(code);
+        }
+        log!("will retry in {}", dur(set.interval));
+        p.hold = Some(Instant::now() + set.interval);
+        return None;
+    }
     let dirty = std::mem::take(&mut p.dirty);
     let moves = std::mem::take(&mut p.moves);
     let links = std::mem::take(&mut p.links);
@@ -444,9 +456,10 @@ fn process(
     }
     let why = p.why;
     (p.first, p.last, p.now, p.hold) = (None, None, false, None);
-    status.set(&[("state", "syncing"), ("pair", &ps.pair.name)], eng);
     let o = if rescan {
+        let t0 = Instant::now();
         let o = full_pass(eng, ps, set, why, status);
+        p.full_took = t0.elapsed();
         if o.is_ok() {
             status.set(&[("last_full_pass", &epoch())], eng);
         }
@@ -494,7 +507,7 @@ fn process(
         }
     }
     cool.retain(|_, t| *t > now);
-    after_pass(p, o, set, cool);
+    after_pass(&ps.pair.name, p, o, set, cool);
     status.set(&[("state", "watching"), ("pair", ""), ("pending", &p.dirty.len().to_string())], eng);
     None
 }
@@ -512,7 +525,13 @@ fn queue(p: &mut Pending, cool: &HashMap<Vec<u8>, Instant>, rel: Vec<u8>, f: u8,
 }
 
 /// Requeues what a pass couldn't finish.
-fn after_pass(p: &mut Pending, o: Result<Outcome, String>, set: &Settings, cool: &HashMap<Vec<u8>, Instant>) {
+fn after_pass(
+    name: &str,
+    p: &mut Pending,
+    o: Result<Outcome, String>,
+    set: &Settings,
+    cool: &HashMap<Vec<u8>, Instant>,
+) {
     let now = Instant::now();
     match o {
         Ok(o) if o.aborted.is_none() => {
@@ -522,9 +541,12 @@ fn after_pass(p: &mut Pending, o: Result<Outcome, String>, set: &Settings, cool:
                 queue(p, cool, rel, SELF, now);
             }
             // Wait a while so a burst of linking (cp -al, package installs)
-            // costs one pass.
+            // costs one pass, and on a big pair long enough that these
+            // passes take at most a tenth of the time, like busy files.
             if o.links_unknown && p.relink.is_none() {
-                p.relink = Some(now + set.link_delay);
+                let wait = set.link_delay.max(p.full_took * COOL_FACTOR);
+                vlog!("{name}: full pass for new hard links in {}", dur(wait));
+                p.relink = Some(now + wait);
             }
         }
         _ => {
@@ -543,6 +565,7 @@ fn epoch() -> String {
 struct Status {
     path: Option<PathBuf>,
     fields: Mutex<BTreeMap<&'static str, String>>,
+    passes: std::sync::atomic::AtomicU64,
 }
 
 impl Status {
@@ -550,11 +573,28 @@ impl Status {
         let mut f = BTreeMap::new();
         f.insert("pid", std::process::id().to_string());
         f.insert("started", epoch());
-        Status { path, fields: Mutex::new(f) }
+        f.insert("passes", "0".into());
+        Status { path, fields: Mutex::new(f), passes: Default::default() }
     }
 
-    fn set(&self, kv: &[(&'static str, &str)], eng: &Engine) {
-        let Some(path) = &self.path else { return };
+    /// Before a pass writes anything to `pair`'s destination: sets the state
+    /// and counts the pass, so a reader that sees the same `passes` before
+    /// and after something knows no pass started in between. A pass that
+    /// can't be recorded doesn't start: that would break this promise.
+    fn begin_pass(&self, state: &'static str, pair: &str, eng: &Engine) -> Result<(), String> {
+        let n = self.passes.fetch_add(1, Relaxed) + 1;
+        if self.set(&[("state", state), ("pair", pair), ("passes", &n.to_string())], eng) {
+            return Ok(());
+        }
+        eng.stats.errors.fetch_add(1, Relaxed);
+        let why = format!("{pair}: not syncing while the status file can't be written");
+        log!("error: {why}");
+        Err(why)
+    }
+
+    /// Returns false if the status file couldn't be written.
+    fn set(&self, kv: &[(&'static str, &str)], eng: &Engine) -> bool {
+        let Some(path) = &self.path else { return true };
         let mut f = self.fields.lock().unwrap();
         for (k, v) in kv {
             f.insert(k, v.to_string());
@@ -576,6 +616,8 @@ impl Status {
         };
         if let Err(e) = write() {
             log!("warning: can't write status file {}: {e}", path.display());
+            return false;
         }
+        true
     }
 }

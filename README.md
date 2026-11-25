@@ -63,7 +63,7 @@ rescan = 6              # hours between full safety passes (0 = never)
 settle = 2              # seconds of quiet before syncing a burst of changes
 max_delay = 30          # ...but never wait longer than this
 interval = 10           # minutes between passes for sources that can't be watched
-link_delay = 300        # backstop: full pass for hard links whose other names weren't found
+link_delay = 300        # backstop: full pass for hard links whose other names weren't found (not on btrfs)
 inplace_min = "32M"     # update existing files at least this big in place
 status_file = "/run/backup.status"
 exit_on_error = true    # stop when the destination fails, instead of retrying
@@ -157,22 +157,28 @@ On a 9.6 GB, 205k-entry tree (warm cache, NVMe):
   cycle.
 - **Files changed mid-copy:** these are queued again. The destination's mtime
   is the one from before the copy, so a later pass also notices.
-- **Hard links while watching:** hard links are equal names for one inode,
-  and nothing records an inode's names, so fansync keeps its own records:
-  - every multiply-linked file's names
-  - for every single-linked file, the directory it's in (about 20–30 bytes
-    per file)
+- **Hard links while watching:** hard links are equal names for one inode.
+  When `ln a b` makes a second name, fansync finds the first one and links
+  `b` in the backup right away. Writes go to the inode, so a change made
+  through one name updates the backup under all of them, even if that name
+  is removed or replaced before it's synced. On a host, fansync learns of
+  every link-count change from fanotify's nameless inode events, opens the
+  file by handle, and syncs all its names.
 
-  When `ln a b` makes a second name, the first is found through those
-  records and `b` is linked in the backup right away. Writes go to the
-  inode, so a change made through one name updates the backup under all of
-  them, even if that name is removed or replaced before it's synced. On a
-  host, fansync learns of every link-count change from fanotify's nameless
-  inode events, opens the file by handle, and syncs all its names.
+  On btrfs, finding names is exact: btrfs records every name of an inode,
+  and fansync looks them up (`BTRFS_IOC_TREE_SEARCH_V2` and
+  `BTRFS_IOC_INO_LOOKUP`, which need root). Names outside the pair or in
+  excluded directories are then known to need nothing.
 
-  If a name still can't be found (it's outside the pair, or under the
-  container fallback below), a full pass runs `link_delay` seconds later.
-  Until then the new name is a separate copy with the same content.
+  Other filesystems don't record an inode's names, so fansync keeps its own
+  records: every multiply-linked file's names, and for every single-linked
+  file, the directory it's in (about 20–30 bytes per file). If a name still
+  can't be found (it's outside the pair or excluded, its directory was
+  renamed, or it's under the container fallback below), a full pass runs
+  `link_delay` seconds later, but no sooner than 10 times as long as the
+  last full pass took, so on a big pair these passes take at most a tenth
+  of the time. Until then the new name is a separate copy with the same
+  content.
 - **Unmounted source or destination:** if either filesystem changes while
   running (for example an unmount), passes fail instead of mirroring an empty
   mount point or writing elsewhere. They're retried every `interval` minutes
@@ -233,21 +239,34 @@ On a 9.6 GB, 205k-entry tree (warm cache, NVMe):
 ## Memory
 
 Between passes fansync keeps what it needs to link hard links right away:
-the directory of every file, and the full names of every hard-linked one.
-That's about 100–150 MB per million files, measured with a quarter of them
-hard-linked (each hard-linked name costs a few hundred bytes, other files
-a few dozen). It stays flat however long fansync runs: the records are
-rebuilt by each full pass, changes waiting to be synced are merged per path
-and capped at a million paths (beyond that, a full pass runs instead), and
-memory freed after a pass is handed back to the system.
+the full names of every hard-linked file (a few hundred bytes each) and,
+except on btrfs (which fansync asks instead), the directory of every other
+file (a few dozen bytes each). With a quarter of the files hard-linked,
+that's at most about 100–150 MB per million files. It stays flat however
+long fansync runs: the records are rebuilt by each full pass, changes
+waiting to be synced are merged per path and capped at a million paths
+(beyond that, a full pass runs instead), and memory freed after a pass is
+handed back to the system.
 
 ## Monitoring
 
 `--status-file FILE` keeps a file of shell `KEY='value'` lines up to date:
 `state` (`initial-sync`, `watching`, `syncing`, `done`, `stopped`, `failed`),
-`pair`, `pid`, `started`, `updated`, `last_full_pass`, `last_change`,
-`pending`, `copied_files`, `written_bytes`, `deleted`, `errors`, and `error`
-(why fansync stopped, with `--exit-on-error`).
+`pair`, `passes`, `pid`, `started`, `updated`, `last_full_pass`,
+`last_change`, `pending`, `copied_files`, `written_bytes`, `deleted`,
+`errors`, and `error` (why fansync stopped, with `--exit-on-error`). It's
+replaced atomically, so it's never seen half-written.
+
+Before a pass writes anything to a destination, `state` becomes `syncing`
+(`initial-sync` for the first passes), `pair` names that pair, and `passes`
+goes up by one; when the pass is done, `state` goes back to `watching`. If
+the file can't be written, the pass doesn't start: it waits `interval` and
+tries again (or, with `--exit-on-error`, fansync stops). Passes run one at a
+time, so while one is syncing, the other pairs' destinations aren't being
+written. To act on a destination only while nothing writes to it (say, to
+snapshot it), read the file before and after: if `passes` is the same both
+times and the first read showed `state='watching'` (or another `pair`), no
+pass touched that destination in between.
 
 `-i` prints rsync-style itemized changes (`>f.st...... path`), plus
 `*moving     old => new` for mirrored renames. `-v` prints changed paths and
